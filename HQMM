@@ -1,0 +1,905 @@
+import autograd.numpy as np
+import numpy
+from autograd import elementwise_grad as egrad
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+import tushare as ts
+import pandas as pd
+import math
+'''
+这是正确的代码版本和论文上面的相符合
+
+'''
+
+rho_real = np.loadtxt('rho_real.txt')
+rho_imag = np.loadtxt('rho_imag.txt')
+Kappa_real = np.loadtxt('Kappa_real261.txt')
+Kappa_imag = np.loadtxt('Kappa_imag261.txt')
+
+
+def Herm(M):
+    return np.transpose(np.conj(M))
+
+# def transformMatrix(m):(转置矩阵)
+#     rt = [[] for i in m[0]]    # m[0] 有几个元素，说明原矩阵有多少列。此处创建转置矩阵的行
+#     for ele in m:
+#         for i in range(len(ele)):
+#             # rt[i] 代表新矩阵的第 i 行
+#             # ele[i] 代表原矩阵当前行的第 i 列
+#             rt[i].append(ele[i])
+#     return rt
+
+def Inner_Product(M):
+    return np.dot(Herm(M), M)
+
+
+def DA(x, s=6, seq_len=20):  # s is the number of output symbols in the sequence
+    def fun(t):
+        if t >= 0:
+            return t
+        else:
+            f = (1 - np.exp(-0.25 * t)) / (1 + np.exp(-0.25 * t))
+            return f
+
+    z = fun(1 - x / (np.log(s) * seq_len))
+    return z
+
+
+def like_hood(Kraus, rho_initial=0, train_seq=0, burnin=100):
+    # burn in
+    rho = [[]]
+    for i in train_seq[0:burnin]:
+        rho_new = np.dot(np.conj(Kraus[2 * i - 2:2 * i, :]),
+                         np.dot(rho_initial, np.transpose(Kraus[2 * i - 2:2 * i, :])))
+        rho_initial = rho_new / np.trace(rho_new)
+    # calculate like-hood
+    for j in train_seq[burnin:]:
+        rho = np.dot(np.conj(Kraus[2 * j - 2:2 * j, :]),
+                     np.dot(rho_initial, np.transpose(Kraus[2 * j - 2:2 * j, :])))
+        rho_initial = rho
+    p = np.trace(rho)
+    return -np.log(np.real(p))
+
+def like_hood_rho(Kraus, rho_initial=0, train_seq=0, burnin=100):
+    # burn in
+    rho = [[]]
+    # for i in train_seq[0:burnin]:
+    #     rho_new = np.dot(np.conj(Kraus[2 * i - 2:2 * i, :]),
+    #                      np.dot(rho_initial, np.transpose(Kraus[2 * i - 2:2 * i, :])))
+    #     rho_initial = rho_new / np.trace(rho_new)
+    # calculate like-hood
+    for j in train_seq:
+        rho = np.dot(np.conj(Kraus[2 * j - 2:2 * j, :]),
+                     np.dot(rho_initial, np.transpose(Kraus[2 * j - 2:2 * j, :])))
+        rho_initial = rho
+    p = np.trace(rho)
+    return -np.log(np.real(p)), rho
+
+
+
+Kraus_grad = egrad(like_hood)
+
+
+
+# 定义超参数
+
+# 获取数据
+
+ts.set_token('3ecde5f3e9a9b5d9a1f1667b22ec0f19ddcb5320ff163ae9ab721e92')
+pro = ts.pro_api()
+pro = ts.pro_api('3ecde5f3e9a9b5d9a1f1667b22ec0f19ddcb5320ff163ae9ab721e92')
+
+
+
+
+def get_data(stock, start_date, end_date, item):
+    df = pro.daily(ts_code=stock, start_date=start_date, end_date=end_date)
+    dates = pd.to_datetime(df["trade_date"])
+    df = df[['close']]
+    # df.index = dates
+    df.sort_index(ascending=False, inplace=True)
+    df['close'].values[0]
+    df1 = df['close'].values[1:]
+    df2 = df['close'].values[:-1]
+    df3 = df1 - df2
+    for i in range(0, item):
+        if 0 <= df3[i] <= 2:
+            df['close'].values[i] = 1
+        elif 2 <= df3[i] <= 5:
+            df['close'].values[i] = 3
+        elif df3[i] >= 5:
+            df['close'].values[i] = 5
+        elif -2 <= df3[i] <= 0:
+            df['close'].values[i] = 2
+        elif -5 <= df3[i] <= -2:
+            df['close'].values[i] = 4
+        elif df3[i] <= -5:
+            df['close'].values[i] = 6
+    df = df['close'].values[:-1]
+    return df
+
+df_train = get_data(stock='600022.SH', start_date='20170601', end_date='20171026', item=100)
+df_val = get_data(stock='600022.SH', start_date='20191030', end_date='20200824', item=200)
+df_test = get_data(stock='600022.SH', start_date='20200824', end_date='20210623', item=200)
+
+I = np.identity(4)  # 单位矩阵
+Tmax = 40 # 最大迭代次数
+batch = 5  # 最大batch对所有的数据20 x 3000
+burnin = 5
+seq_num = 1
+train_data = df_train
+train_seq = train_data.reshape(batch, 20)
+train_seq = train_seq.astype(int)
+print('training process start...')
+tau, alpha, beta = 0.72, 0.96, 0.9
+DA_train = []
+Kappa = Kappa_real + 1j * Kappa_imag
+print('initial kappa')
+print(Kappa)
+rho_initial = rho_real + 1j * rho_imag
+# rho_initial = np.loadtxt('rhoR.txt')
+G_old = 0
+val_data = df_val
+val_data = val_data.astype(int)
+batch_val = 5
+val_data = val_data.reshape(batch_val, 40)
+DA_val = []
+loss_val = []
+test_data = df_test
+test_data = test_data.astype(int)
+batch_test = 5
+test_data = test_data.reshape(batch_test, 40)
+for i in tqdm(range(Tmax)):
+    loss = []
+    rho_initial = np.loadtxt('rhoR.txt')
+    for j in range(batch):
+        seq = train_seq[j, :]
+        G = Kraus_grad(np.conj(Kappa), rho_initial=rho_initial, train_seq=seq, burnin=10)
+        F = np.linalg.norm(G, ord=2)
+        G = G / F
+        G = beta * G_old + (1 - beta) * G
+        E = np.linalg.norm(G, ord=2)
+        G = G / E
+        U = np.hstack((G, Kappa))
+        V = np.hstack((Kappa, -G))
+        Inverse = I + tau / 2 * np.dot(Herm(V), U)
+        item1 = np.dot(U, np.linalg.inv(Inverse))
+        item2 = np.dot(Herm(V), Kappa)
+        Kappa = Kappa - tau * np.dot(item1, item2)
+        G_old = G
+        L_train, rho = like_hood_rho(np.conj(Kappa), rho_initial=rho_initial, train_seq=seq, burnin=10)
+        loss.append(like_hood(np.conj(Kappa), rho_initial=rho_initial, train_seq=seq, burnin=10))
+    # validation process
+    for i in range(batch_val):
+        val_seq = val_data[i, :]
+        L_val = like_hood(np.conj(Kappa), rho_initial=rho_initial, train_seq=val_seq, burnin=10)
+        loss_val.append(L_val)
+    DA_val.append(DA(np.mean(loss_val), s=6, seq_len=20))
+    #print(DA_val)
+    DA_train.append(DA(np.mean(loss)))
+    tau = alpha * tau
+plt.plot(range(Tmax), DA_train)
+print(DA_train)
+plt.show()
+plt.close()
+
+# test process
+rho_initial = np.loadtxt('rhoR.txt')
+loss_test = []
+for i in range(batch_test):
+    test_seq = test_data[i,: ]
+    L_test = like_hood(np.conj(Kappa), rho_initial=rho_initial, train_seq=test_seq, burnin=10)
+    loss_test.append(L_test)
+DA_test = DA(np.mean(loss_test))
+print('the best DA of test data is')
+print(DA_test)
+print('new kappa')
+print(Kappa)
+rho_l = rho/(np.trace(rho))
+print(rho_l)
+k1, k2, k3, k4, k5, k6 = numpy.split(Kappa, 6, axis=0)
+print(k1, k2, k3, k4, k5, k6)
+k11 = numpy.matrix.getH(k1)
+k22 = numpy.matrix.getH(k2)
+k33 = numpy.matrix.getH(k3)
+k44 = numpy.matrix.getH(k4)
+k55 = numpy.matrix.getH(k5)
+k66 = numpy.matrix.getH(k6)
+print(k11)
+J1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_l), k11))), )
+J2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_l), k22))), )
+J3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_l), k33))), )
+J4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_l), k44))), )
+J5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_l), k55))), )
+J6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_l), k66))), )
+J = min(J1, J2 ,J3, J4, J5, J6)
+if J == J1:
+        print('next state is 1' )
+        ka = k1
+        kaa = k11
+elif J == J2:
+        print('next state is 2' )
+        ka = k2
+        kaa = k22
+elif J == J3:
+        print('next state is 3' )
+        ka = k3
+        kaa = k33
+elif J == J4:
+        print('next state is 4' )
+        ka = k4
+        kaa = k44
+elif J == J5:
+        print('next state is 5' )
+        ka = k5
+        kaa = k55
+elif J == J6:
+        print('next state is 6')
+        ka = k6
+        kaa = k66
+
+rho_b = (numpy.matmul(numpy.matmul(ka, rho_l), kaa))/(np.trace(numpy.matmul(numpy.matmul(ka, rho_l), kaa)))
+
+Jb1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_b), k11))), )
+Jb2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_b), k22))), )
+Jb3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_b), k33))), )
+Jb4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_b), k44))), )
+Jb5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_b), k55))), )
+Jb6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_b), k66))), )
+
+Jb = min(Jb1, Jb2, Jb3, Jb4, Jb5, Jb6)
+if Jb == Jb1:
+        print('second state is 1' )
+        kb = k1
+        kbb = k11
+elif Jb == Jb2:
+        print('second state is 2' )
+        kb = k2
+        kbb = k22
+elif Jb == Jb3:
+        print('second state is 3')
+        kb = k3
+        kbb = k33
+elif Jb == Jb4:
+        print('second state is 4')
+        kb = k4
+        kbb = k44
+elif Jb == Jb5:
+        print('second state is 5')
+        kb = k5
+        kbb = k55
+elif Jb == Jb6:
+        print('second state is 6')
+        kb = k6
+        kbb = k66
+
+rho_c = (numpy.matmul(numpy.matmul(kb, rho_b), kbb))/(np.trace(numpy.matmul(numpy.matmul(kb, rho_b), kbb)))
+
+Jc1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_c), k11))), )
+Jc2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_c), k22))), )
+Jc3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_c), k33))), )
+Jc4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_c), k44))), )
+Jc5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_c), k55))), )
+Jc6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_c), k66))), )
+
+Jc = min(Jc1, Jc2, Jc3, Jc4, Jc5, Jc6)
+if Jc == Jc1:
+        print('third state is 1' )
+        kc = k1
+        kcc = k11
+elif Jc == Jc2:
+        print('third state is 2' )
+        kc = k2
+        kcc = k22
+elif Jc == Jc3:
+        print('third state is 3')
+        kc = k3
+        kcc = k33
+elif Jc == Jc4:
+        print('third state is 4')
+        kc = k4
+        kcc = k44
+elif Jc == Jc5:
+        print('third state is 5')
+        kc = k5
+        kcc = k55
+elif Jc == Jc6:
+        print('third state is 6')
+        kc = k6
+        kcc = k66
+
+rho_d = (numpy.matmul(numpy.matmul(kc, rho_c), kcc))/(np.trace(numpy.matmul(numpy.matmul(kc, rho_c), kcc)))
+
+Jd1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_d), k11))), )
+Jd2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_d), k22))), )
+Jd3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_d), k33))), )
+Jd4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_d), k44))), )
+Jd5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_d), k55))), )
+Jd6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_d), k66))), )
+
+Jd = min(Jd1, Jd2, Jd3, Jd4, Jd5, Jd6)
+if Jd == Jd1:
+        print('fourth state is 1' )
+        kd = k1
+        kdd = k11
+elif Jd == Jd2:
+        print('fourth state is 2' )
+        kd = k2
+        kdd = k22
+elif Jd == Jd3:
+        print('fourth state is 3')
+        kd = k3
+        kdd = k33
+elif Jd == Jd4:
+        print('fourth state is 4')
+        kd = k4
+        kdd = k44
+elif Jd == Jd5:
+        print('fourth state is 5')
+        kd = k5
+        kdd = k55
+elif Jd == Jd6:
+        print('fourth state is 6')
+        kd = k6
+        kdd = k66
+
+rho_e = (numpy.matmul(numpy.matmul(kd, rho_d), kdd))/(np.trace(numpy.matmul(numpy.matmul(kd, rho_d), kdd)))
+
+Je1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_e), k11))), )
+Je2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_e), k22))), )
+Je3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_e), k33))), )
+Je4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_e), k44))), )
+Je5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_e), k55))), )
+Je6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_e), k66))), )
+
+Je = min(Je1, Je2, Je3, Je4, Je5, Je6)
+if Je == Je1:
+        print('firth state is 1' )
+        ke = k1
+        kee = k11
+elif Je == Je2:
+        print('firth state is 2' )
+        ke = k2
+        kee = k22
+elif Je == Je3:
+        print('firth state is 3')
+        ke = k3
+        kee = k33
+elif Je == Je4:
+        print('firth state is 4')
+        ke = k4
+        kee = k44
+elif Je == Je5:
+        print('firth state is 5')
+        ke = k5
+        kee = k55
+elif Je == Je6:
+        print('firth '
+              'ate is 6')
+        ke = k6
+        kee = k66
+
+rho_f = (numpy.matmul(numpy.matmul(ke, rho_e), kee))/(np.trace(numpy.matmul(numpy.matmul(ke, rho_e), kee)))
+
+Jf1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_f), k11))), )
+Jf2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_f), k22))), )
+Jf3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_f), k33))), )
+Jf4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_f), k44))), )
+Jf5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_f), k55))), )
+Jf6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_f), k66))), )
+
+Jf = min(Jf1, Jf2, Jf3, Jf4, Jf5, Jf6)
+if Jf == Jf1:
+        print('netx state is 1' )
+        kf = k1
+        kff = k11
+elif Jf == Jf2:
+        print('netx state is 2' )
+        kf = k2
+        kff = k22
+elif Jf == Jf3:
+        print('netx state is 3')
+        kf = k3
+        kff = k33
+elif Jf == Jf4:
+        print('netx state is 4')
+        kf = k4
+        kff = k44
+elif Jf == Jf5:
+        print('netx state is 5')
+        kf = k5
+        kff = k55
+elif Jf == Jf6:
+        print('netx ate is 6')
+        kf = k6
+        kff = k66
+        
+rho_g = (numpy.matmul(numpy.matmul(kf, rho_f), kff))/(np.trace(numpy.matmul(numpy.matmul(kf, rho_f), kff)))
+
+Jg1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_g), k11))), )
+Jg2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_g), k22))), )
+Jg3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_g), k33))), )
+Jg4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_g), k44))), )
+Jg5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_g), k55))), )
+Jg6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_g), k66))), )
+
+Jg = min(Jg1, Jg2, Jg3, Jg4, Jg5, Jg6)
+if Jg == Jg1:
+        print('netx state is 1' )
+        kg = k1
+        kgg = k11
+elif Jg == Jg2:
+        print('netx state is 2' )
+        kg = k2
+        kgg = k22
+elif Jg == Jg3:
+        print('netx state is 3')
+        kg = k3
+        kgg = k33
+elif Jg == Jg4:
+        print('netx state is 4')
+        kg = k4
+        kgg = k44
+elif Jg == Jg5:
+        print('netx state is 5')
+        kg = k5
+        kgg = k55
+elif Jg == Jg6:
+        print('netx ate is 6')
+        kg = k6
+        kgg = k66
+        
+rho_h = (numpy.matmul(numpy.matmul(kg, rho_g), kgg))/(np.trace(numpy.matmul(numpy.matmul(kg, rho_g), kgg)))
+
+Jh1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_h), k11))), )
+Jh2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_h), k22))), )
+Jh3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_h), k33))), )
+Jh4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_h), k44))), )
+Jh5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_h), k55))), )
+Jh6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_h), k66))), )
+
+Jh = min(Jh1, Jh2, Jh3, Jh4, Jh5, Jh6)
+if Jh == Jh1:
+        print('netx state is 1' )
+        kh = k1
+        khh = k11
+elif Jh == Jh2:
+        print('netx state is 2' )
+        kh = k2
+        khh = k22
+elif Jh == Jh3:
+        print('netx state is 3')
+        kh = k3
+        khh = k33
+elif Jh == Jh4:
+        print('netx state is 4')
+        kh = k4
+        khh = k44
+elif Jh == Jh5:
+        print('netx state is 5')
+        kh = k5
+        khh = k55
+elif Jh == Jh6:
+        print('netx ate is 6')
+        kh = k6
+        khh = k66
+
+rho_i = (numpy.matmul(numpy.matmul(kh, rho_h), khh)) / (np.trace(numpy.matmul(numpy.matmul(kh, rho_h), khh)))
+
+Ji1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_i), k11))), )
+Ji2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_i), k22))), )
+Ji3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_i), k33))), )
+Ji4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_i), k44))), )
+Ji5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_i), k55))), )
+Ji6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_i), k66))), )
+
+Ji = min(Ji1, Ji2, Ji3, Ji4, Ji5, Ji6)
+if Ji == Ji1:
+    print('netx state is 1')
+    ki = k1
+    kii = k11
+elif Ji == Ji2:
+    print('netx state is 2')
+    ki = k2
+    kii = k22
+elif Ji == Ji3:
+    print('netx state is 3')
+    ki = k3
+    kii = k33
+elif Ji == Ji4:
+    print('netx state is 4')
+    ki = k4
+    kii = k44
+elif Ji == Ji5:
+    print('netx state is 5')
+    ki = k5
+    kii = k55
+elif Ji == Ji6:
+    print('netx ate is 6')
+    ki = k6
+    kii = k6
+
+rho_j = (numpy.matmul(numpy.matmul(ki, rho_i), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_i), kii)))
+
+Jj1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_j), k11))), )
+Jj2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_j), k22))), )
+Jj3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_j), k33))), )
+Jj4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_j), k44))), )
+Jj5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_j), k55))), )
+Jj6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_j), k66))), )
+
+Jj = min(Jj1, Jj2, Jj3, Jj4, Jj5, Jj6)
+if Jj == Jj1:
+    print('netx state is 1')
+    kj = k1
+    kjj = k11
+elif Jj == Jj2:
+    print('netx state is 2')
+    kj = k2
+    kjj = k22
+elif Jj == Jj3:
+    print('netx state is 3')
+    kj = k3
+    kjj = k33
+elif Jj == Jj4:
+    print('netx state is 4')
+    kj = k4
+    kjj = k44
+elif Jj == Jj5:
+    print('netx state is 5')
+    kj = k5
+    kjj = k55
+elif Jj == Jj6:
+    print('netx ate is 6')
+    kj = k6
+    kjj = k66
+
+rho_k = (numpy.matmul(numpy.matmul(ki, rho_j), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_j), kii)))
+
+Jk1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_k), k11))), )
+Jk2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_k), k22))), )
+Jk3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_k), k33))), )
+Jk4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_k), k44))), )
+Jk5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_k), k55))), )
+Jk6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_k), k66))), )
+
+Jk = min(Jk1, Jk2, Jk3, Jk4, Jk5, Jk6)
+if Jk == Jk1:
+    print('netx state is 1')
+    kk = k1
+    kkk = k11
+elif Jk == Jk2:
+    print('netx state is 2')
+    kk = k2
+    kkk = k22
+elif Jk == Jk3:
+    print('netx state is 3')
+    kk = k3
+    kkk = k33
+elif Jk == Jk4:
+    print('netx state is 4')
+    kk = k4
+    kkk = k44
+elif Jk == Jk5:
+    print('netx state is 5')
+    kk = k5
+    kkk = k55
+elif Jk == Jk6:
+    print('netx ate is 6')
+    kk = k6
+    kkk = k66
+
+rho_l = (numpy.matmul(numpy.matmul(ki, rho_k), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_k), kii)))
+
+Jl1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_l), k11))), )
+Jl2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_l), k22))), )
+Jl3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_l), k33))), )
+Jl4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_l), k44))), )
+Jl5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_l), k55))), )
+Jl6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_l), k66))), )
+
+Jl = min(Jl1, Jl2, Jl3, Jl4, Jl5, Jl6)
+if Jl == Jl1:
+    print('netx state is 1')
+    kl = k1
+    kll = k11
+elif Jl == Jl2:
+    print('netx state is 2')
+    kl = k2
+    kll = k22
+elif Jl == Jl3:
+    print('netx state is 3')
+    kl = k3
+    kll = k33
+elif Jl == Jl4:
+    print('netx state is 4')
+    kl = k4
+    kll = k44
+elif Jl == Jl5:
+    print('netx state is 5')
+    kl = k5
+    kll = k55
+elif Jl == Jl6:
+    print('netx ate is 6')
+    kl = k6
+    kll = k66
+
+rho_m = (numpy.matmul(numpy.matmul(ki, rho_l), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_l), kii)))
+
+Jm1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_m), k11))), )
+Jm2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_m), k22))), )
+Jm3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_m), k33))), )
+Jm4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_m), k44))), )
+Jm5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_m), k55))), )
+Jm6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_m), k66))), )
+
+Jm = min(Jm1, Jm2, Jm3, Jm4, Jm5, Jm6)
+if Jm == Jm1:
+    print('netx state is 1')
+    km = k1
+    kmm = k11
+elif Jm == Jm2:
+    print('netx state is 2')
+    km = k2
+    kmm = k22
+elif Jm == Jm3:
+    print('netx state is 3')
+    km = k3
+    kmm = k33
+elif Jm == Jm4:
+    print('netx state is 4')
+    km = k4
+    kmm = k44
+elif Jm == Jm5:
+    print('netx state is 5')
+    km = k5
+    kmm = k55
+elif Jm == Jm6:
+    print('netx ate is 6')
+    km = k6
+    kmm = k66
+
+rho_n = (numpy.matmul(numpy.matmul(ki, rho_m), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_m), kii)))
+
+Jn1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_n), k11))), )
+Jn2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_n), k22))), )
+Jn3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_n), k33))), )
+Jn4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_n), k44))), )
+Jn5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_n), k55))), )
+Jn6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_n), k66))), )
+
+Jn = min(Jn1, Jn2, Jn3, Jn4, Jn5, Jn6)
+if Jn == Jn1:
+    print('netx state is 1')
+    kn = k1
+    knn = k11
+elif Jn == Jn2:
+    print('netx state is 2')
+    kn = k2
+    knn = k22
+elif Jn == Jn3:
+    print('netx state is 3')
+    kn = k3
+    knn = k33
+elif Jn == Jn4:
+    print('netx state is 4')
+    kn = k4
+    knn = k44
+elif Jn == Jn5:
+    print('netx state is 5')
+    kn = k5
+    knn = k55
+elif Jn == Jn6:
+    print('netx ate is 6')
+    kn = k6
+    knn = k66
+
+rho_o = (numpy.matmul(numpy.matmul(ki, rho_n), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_n), kii)))
+
+Jo1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_o), k11))), )
+Jo2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_o), k22))), )
+Jo3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_o), k33))), )
+Jo4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_o), k44))), )
+Jo5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_o), k55))), )
+Jo6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_o), k66))), )
+
+Jo = min(Jo1, Jo2, Jo3, Jo4, Jo5, Jo6)
+if Jo == Jo1:
+    print('netx state is 1')
+    ko = k1
+    koo = k11
+elif Jo == Jo2:
+    print('netx state is 2')
+    ko = k2
+    koo = k22
+elif Jo == Jo3:
+    print('netx state is 3')
+    ko = k3
+    koo = k33
+elif Jo == Jo4:
+    print('netx state is 4')
+    ko = k4
+    koo = k44
+elif Jo == Jo5:
+    print('netx state is 5')
+    ko = k5
+    koo = k55
+elif Jo == Jo6:
+    print('netx ate is 6')
+    ko = k6
+    koo = k66
+
+rho_p = (numpy.matmul(numpy.matmul(ki, rho_o), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_o), kii)))
+
+Jp1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_p), k11))), )
+Jp2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_p), k22))), )
+Jp3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_p), k33))), )
+Jp4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_p), k44))), )
+Jp5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_p), k55))), )
+Jp6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_p), k66))), )
+
+Jp = min(Jp1, Jp2, Jp3, Jp4, Jp5, Jp6)
+if Jp == Jp1:
+    print('netx state is 1')
+    kp = k1
+    kpp = k11
+elif Jp == Jp2:
+    print('netx state is 2')
+    kp = k2
+    kpp = k22
+elif Jp == Jp3:
+    print('netx state is 3')
+    kp = k3
+    kpp = k33
+elif Jp == Jp4:
+    print('netx state is 4')
+    kp = k4
+    kpp = k44
+elif Jp == Jp5:
+    print('netx state is 5')
+    kp = k5
+    kpp = k55
+elif Jp == Jp6:
+    print('netx ate is 6')
+    kp = k6
+    kpp = k66
+
+rho_q = (numpy.matmul(numpy.matmul(ki, rho_p), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_p), kii)))
+
+Jq1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_q), k11))), )
+Jq2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_q), k22))), )
+Jq3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_q), k33))), )
+Jq4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_q), k44))), )
+Jq5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_q), k55))), )
+Jq6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_q), k66))), )
+
+Jq = min(Jq1, Jq2, Jq3, Jq4, Jq5, Jq6)
+if Jq == Jq1:
+    print('netx state is 1')
+    kq = k1
+    kqq = k11
+elif Jq == Jq2:
+    print('netx state is 2')
+    kq = k2
+    kqq = k22
+elif Jq == Jq3:
+    print('netx state is 3')
+    kq = k3
+    kqq = k33
+elif Jq == Jq4:
+    print('netx state is 4')
+    kq = k4
+    kqq = k44
+elif Jq == Jq5:
+    print('netx state is 5')
+    kq = k5
+    kqq = k55
+elif Jq == Jq6:
+    print('netx ate is 6')
+    kq = k6
+    kqq = k66
+
+rho_r = (numpy.matmul(numpy.matmul(ki, rho_q), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_q), kii)))
+
+Jr1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_r), k11))), )
+Jr2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_r), k22))), )
+Jr3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_r), k33))), )
+Jr4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_r), k44))), )
+Jr5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_r), k55))), )
+Jr6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_r), k66))), )
+
+Jr = min(Jr1, Jr2, Jr3, Jr4, Jr5, Jr6)
+if Jr == Jr1:
+    print('netx state is 1')
+    kr = k1
+    krr = k22
+elif Jr == Jr2:
+    print('netx state is 2')
+    kr = k2
+    krr = k22
+elif Jr == Jr3:
+    print('netx state is 3')
+    kr = k3
+    krr = k33
+elif Jr == Jr4:
+    print('netx state is 4')
+    kr = k4
+    krr = k44
+elif Jr == Jr5:
+    print('netx state is 5')
+    kr = k5
+    krr = k55
+elif Jr == Jr6:
+    print('netx ate is 6')
+    kr = k6
+    krr = k66
+
+rho_s = (numpy.matmul(numpy.matmul(ki, rho_r), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_r), kii)))
+
+Js1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_s), k11))), )
+Js2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_s), k22))), )
+Js3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_s), k33))), )
+Js4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_s), k44))), )
+Js5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_s), k55))), )
+Js6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_s), k66))), )
+
+Js = min(Js1, Js2, Js3, Js4, Js5, Js6)
+if Js == Js1:
+    print('netx state is 1')
+    ks = k1
+    kss = k22
+elif Js == Js2:
+    print('netx state is 2')
+    ks = k2
+    kss = k22
+elif Js == Js3:
+    print('netx state is 3')
+    ks = k3
+    kss = k33
+elif Js == Js4:
+    print('netx state is 4')
+    ks = k4
+    kss = k44
+elif Js == Js5:
+    print('netx state is 5')
+    ks = k5
+    kss = k55
+elif Js == Js6:
+    print('netx ate is 6')
+    ks = k6
+    kss = k66
+
+rho_t = (numpy.matmul(numpy.matmul(ki, rho_s), kii)) / (np.trace(numpy.matmul(numpy.matmul(ki, rho_s), kii)))
+
+Jt1 = -math.log((np.trace(numpy.matmul(numpy.matmul(k1, rho_t), k11))), )
+Jt2 = -math.log((np.trace(numpy.matmul(numpy.matmul(k2, rho_t), k22))), )
+Jt3 = -math.log((np.trace(numpy.matmul(numpy.matmul(k3, rho_t), k33))), )
+Jt4 = -math.log((np.trace(numpy.matmul(numpy.matmul(k4, rho_t), k44))), )
+Jt5 = -math.log((np.trace(numpy.matmul(numpy.matmul(k5, rho_t), k55))), )
+Jt6 = -math.log((np.trace(numpy.matmul(numpy.matmul(k6, rho_t), k66))), )
+
+Jt = min(Jt1, Jt2, Jt3, Jt4, Jt5, Jt6)
+if Jt == Jt1:
+    print('netx state is 1')
+    kt = k1
+    ktt = k22
+elif Jt == Jt2:
+    print('netx state is 2')
+    kt = k2
+    ktt = k22
+elif Jt == Jt3:
+    print('netx state is 3')
+    kt = k3
+    ktt = k33
+elif Jt == Jt4:
+    print('netx state is 4')
+    kt = k4
+    ktt = k44
+elif Jt == Jt5:
+    print('netx state is 5')
+    kt = k5
+    ktt = k55
+elif Jt == Jt6:
+    print('netx ate is 6')
+    kt = k6
+    ktt = k66
